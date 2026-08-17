@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; background: transparent; }
+        .container {
+            position: relative; width: 100%; max-width: 960px;
+            border-radius: 12px; overflow: hidden;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            background: #ffffff;
+            min-height: 420px;
+        }
+        video { width: 100%; height: auto; display: block; transform: scaleX(-1); }
+        canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+        .hud {
+            position: absolute; top: 16px; left: 16px;
+            background: rgba(255, 255, 255, 0.95);
+            border: 1px solid #cbd5e1;
+            padding: 12px 20px; border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+        }
+        .score-val { font-size: 32px; font-weight: 700; color: #0056b3; letter-spacing: -0.5px; }
+        .badge { display: inline-block; margin-top: 4px; padding: 4px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+        .badge-good { background: #e6f4ea; color: #1e8e3e; border: 1px solid #ceead6; }
+        .badge-warn { background: #fef7e0; color: #b06000; border: 1px solid #f9e29a; }
+        .badge-bad { background: #fce8e6; color: #d93025; border: 1px solid #fad2cf; }
+        
+        .hud-right { position: absolute; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+        .slouch-badge { background: #fce8e6; border: 1px solid #d93025; padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; color: #d93025; }
+        .timer-box {
+            position: absolute; bottom: 14px; right: 14px;
+            background: rgba(255, 255, 255, 0.95); border: 1px solid #cbd5e1;
+            padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600; color: #334155;
+        }
+        .perm-notice {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(255, 255, 255, 0.95); border: 1px solid #cbd5e1;
+            padding: 24px; border-radius: 8px; text-align: center; display: none; max-width: 85%;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script>
+        function sendMessageToStreamlitClient(type, data) {
+            const outData = Object.assign({
+                isStreamlitMessage: true,
+                type: type,
+            }, data);
+            window.parent.postMessage(outData, "*");
+        }
+
+        const Streamlit = {
+            setComponentReady: function() {
+                sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1});
+            },
+            setFrameHeight: function(height) {
+                sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: height});
+            },
+            setComponentValue: function(value) {
+                sendMessageToStreamlitClient("streamlit:setComponentValue", {value: value});
+            }
+        };
+    </script>
+</head>
+<body>
+    <div class="container" id="main_container">
+        <video id="input_video" playsinline webkit-playsinline muted autoplay></video>
+        <canvas id="output_canvas"></canvas>
+        
+        <div class="hud">
+            <div style="font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 1px;">Clinical Posture Monitor</div>
+            <div class="score-val" id="score_display">100%</div>
+            <div class="badge badge-good" id="status_badge">EXCELLENT POSTURE</div>
+            <div style="margin-top: 6px; font-size: 12px; color: #475569;" id="metrics_text">Neck Tilt: 12.0° | Shoulder Slant: 1.5°</div>
+        </div>
+
+        <div class="hud-right">
+            <div class="slouch-badge" id="slouch_badge">🚨 Slouches: 0</div>
+        </div>
+
+        <div class="timer-box" id="timer_display">⏱️ Session Time: 00:00:00</div>
+        
+        <div class="perm-notice" id="perm_notice">
+            <h3 style="color: #0f172a; margin-top:0;">🔒 Camera Permission Required</h3>
+            <p style="color: #475569;">Please allow camera access to use the Clinical Assessment module.</p>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const scoreDisplay = document.getElementById('score_display');
+        const statusBadge = document.getElementById('status_badge');
+        const metricsText = document.getElementById('metrics_text');
+        const timerDisplay = document.getElementById('timer_display');
+        const slouchBadge = document.getElementById('slouch_badge');
+        const permNotice = document.getElementById('perm_notice');
+
+        let sessionActive = false;
+        let sessionStartTime = null; 
+        let slouchCount = 0;
+        let isCurrentlySlouching = false;
+        let slouchStartTime = 0;
+        let lastBeepTime = 0;
+        
+        let lastReportedSlouchCount = 0;
+        
+        // Futuristic Geometric Face Matrix Connections
+        const FACE_MATRIX_CONNECTIONS = [
+            [0, 1], [1, 2], [2, 3], [3, 7], // Left eye to ear arc
+            [0, 4], [4, 5], [5, 6], [6, 8], // Right eye to ear arc
+            [9, 10], // Mouth
+            [0, 9], [0, 10], // Nose to mouth
+            [7, 9], [8, 10], // Ears to mouth
+            [3, 9], [6, 10], // Outer eyes to mouth
+            [1, 4], // Inner eyes across bridge
+            [7, 0], [8, 0] // Ears to nose
+        ];
+
+        // Auto-resize iframe
+        new MutationObserver(() => {
+            Streamlit.setFrameHeight(document.getElementById('main_container').offsetHeight + 20);
+        }).observe(document.body, {childList: true, subtree: true});
+
+        // Initialize Streamlit handshake
+        window.addEventListener("message", function(event) {
+            if (event.data.type === "streamlit:render") {
+                const args = event.data.args;
+                
+                if (args.session_active !== undefined) {
+                    sessionActive = args.session_active;
+                }
+                if (args.session_start_time) {
+                    sessionStartTime = args.session_start_time * 1000; 
+                } else {
+                    sessionStartTime = null;
+                    slouchCount = 0; 
+                    lastReportedSlouchCount = 0;
+                    slouchBadge.innerText = `🚨 Slouches: 0`;
+                }
+                
+                Streamlit.setFrameHeight(document.getElementById('main_container').offsetHeight + 20);
+            }
+        });
+
+        Streamlit.setComponentReady();
+
+        setInterval(() => {
+            if (sessionActive && sessionStartTime) {
+                let elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+                let hrs = String(Math.floor(elapsed / 3600)).padStart(2, '0');
+                let mins = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
+                let secs = String(elapsed % 60).padStart(2, '0');
+                timerDisplay.innerText = `⏱️ Session Time: ${hrs}:${mins}:${secs}`;
+            } else {
+                timerDisplay.innerText = `⏱️ Session Time: 00:00:00`;
+            }
+        }, 1000);
+
+        function playAudioBeep() {
+            const now = Date.now();
+            if (now - lastBeepTime > 2000) {
+                lastBeepTime = now;
+                try {
+                    let audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    let osc = audioCtx.createOscillator();
+                    let gain = audioCtx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.value = 800; 
+                    gain.gain.value = 0.1;
+                    osc.connect(gain);
+                    gain.connect(audioCtx.destination);
+                    osc.start();
+                    osc.stop(audioCtx.currentTime + 0.3);
+                } catch(e) {}
+            }
+        }
+
+        function syncToStreamlit(score, status, n_angle, s_slant) {
+            if (sessionActive) {
+                Streamlit.setComponentValue({
+                    slouch_count: slouchCount,
+                    score: score,
+                    status: status,
+                    neck_angle: n_angle,
+                    shoulder_slope: s_slant,
+                    timestamp: Date.now()
+                });
+            }
+        }
+
+        function onResults(results) {
+            canvasElement.width = videoElement.videoWidth || 1280;
+            canvasElement.height = videoElement.videoHeight || 720;
+            
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.poseLandmarks) {
+                const lm = results.poseLandmarks;
+                const w = canvasElement.width;
+                const h = canvasElement.height;
+
+                const nose = {x: lm[0].x * w, y: lm[0].y * h};
+                const l_ear = {x: lm[7].x * w, y: lm[7].y * h};
+                const r_ear = {x: lm[8].x * w, y: lm[8].y * h};
+                const l_sh = {x: lm[11].x * w, y: lm[11].y * h};
+                const r_sh = {x: lm[12].x * w, y: lm[12].y * h};
+                const l_hip = {x: lm[23].x * w, y: lm[23].y * h};
+                const r_hip = {x: lm[24].x * w, y: lm[24].y * h};
+
+                const ear_center = {x: (l_ear.x + r_ear.x)/2, y: (l_ear.y + r_ear.y)/2};
+                const sh_center = {x: (l_sh.x + r_sh.x)/2, y: (l_sh.y + r_sh.y)/2};
+                const hip_center = {x: (l_hip.x + r_hip.x)/2, y: (l_hip.y + r_hip.y)/2};
+
+                const dx = sh_center.x - ear_center.x;
+                const dy = sh_center.y - ear_center.y;
+                const neck_angle = Math.abs(Math.atan2(Math.abs(dx), Math.abs(dy)) * (180 / Math.PI));
+                
+                const spine_dx = sh_center.x - hip_center.x;
+                const spine_dy = sh_center.y - hip_center.y;
+                const spine_angle = Math.abs(Math.atan2(Math.abs(spine_dx), Math.abs(spine_dy)) * (180 / Math.PI));
+
+                const sh_dx = Math.abs(r_sh.x - l_sh.x);
+                const sh_dy = Math.abs(r_sh.y - l_sh.y);
+                const shoulder_slant = Math.atan2(sh_dy, sh_dx || 1) * (180 / Math.PI);
+                
+                const fts_ratio = dy / (sh_dx || 1);
+                let slouch_penalty = Math.max(0, (0.65 - fts_ratio) * 200.0);
+                let spine_penalty = Math.max(0, (spine_angle - 3.0) * 6.0);
+
+                let neck_penalty = Math.max(0, (neck_angle - 4.0) * 5.0); 
+                let slant_penalty = Math.max(0, (shoulder_slant - 1.5) * 6.0); 
+                let score = Math.max(0, Math.min(100, Math.round(100 - (neck_penalty + slant_penalty + slouch_penalty + spine_penalty))));
+
+                let color = '#1e8e3e';
+                let statusText = 'EXCELLENT POSTURE';
+                let badgeClass = 'badge badge-good';
+
+                const now = Date.now();
+                if (score < 75) {
+                    color = '#d93025';
+                    statusText = 'POOR POSTURE ALERT';
+                    badgeClass = 'badge badge-bad';
+                    
+                    if (sessionActive) {
+                        playAudioBeep();
+
+                        if (!isCurrentlySlouching) {
+                            isCurrentlySlouching = true;
+                            slouchStartTime = now;
+                        } else if (now - slouchStartTime > 1500) { 
+                            slouchCount++;
+                            slouchBadge.innerText = `🚨 Slouches: ${slouchCount}`;
+                            slouchStartTime = now + 4000;
+                        }
+                    }
+                } else {
+                    isCurrentlySlouching = false;
+                    if (score < 80) {
+                        color = '#b06000';
+                        statusText = 'MILD SLOUCH DETECTED';
+                        badgeClass = 'badge badge-warn';
+                    }
+                }
+                // --- ADVANCED SHARP HEXAGON FACE MESH ---
+                const squished_cx = (lm[0].x + lm[7].x + lm[8].x) / 3;
+                const squished_cy = (lm[0].y + lm[7].y + lm[8].y) / 3;
+                const sh_w = Math.abs(lm[11].x - lm[12].x);
+                
+                // Shift higher to perfectly center on the head
+                const true_face_cx = squished_cx;
+                const true_face_cy = squished_cy - (sh_w * 0.35); 
+                
+                // Tighter width to hug the cheeks perfectly, taller to cover hair/chin
+                const face_w = sh_w * 0.42;
+                const face_h = face_w * 1.55;
+                
+                const matrix_lm = [...results.poseLandmarks];
+                const HEAD_HUD_CONNECTIONS = [];
+                const num_dots = 6; // Hexagon for sharp endings
+                
+                // Generate a sharp pointy hexagon covering the head
+                for (let i = 0; i < num_dots; i++) {
+                    // Shift by PI/2 (90 deg) to make it pointy at top and bottom
+                    const angle = (i / num_dots) * 2 * Math.PI + (Math.PI / 2); 
+                    const px = true_face_cx + (face_w/2) * Math.cos(angle);
+                    const py = true_face_cy + (face_h/2) * Math.sin(angle);
+                    matrix_lm[33 + i] = {x: px, y: py, z: 0};
+                    
+                    // Connect the perimeter
+                    HEAD_HUD_CONNECTIONS.push([33 + i, 33 + ((i + 1) % num_dots)]);
+                }
+                
+                // Add center anchor dot
+                matrix_lm[33 + num_dots] = {x: true_face_cx, y: true_face_cy, z: 0};
+                
+                // Draw inner geometric crosshairs
+                HEAD_HUD_CONNECTIONS.push([33 + 0, 33 + num_dots]); // Sharp Bottom to center
+                HEAD_HUD_CONNECTIONS.push([33 + 3, 33 + num_dots]); // Sharp Top to center
+                HEAD_HUD_CONNECTIONS.push([33 + 2, 33 + 4]); // Horizontal bar across eyes
+                HEAD_HUD_CONNECTIONS.push([33 + 1, 33 + 5]); // Horizontal bar across mouth
+
+                const UPPER_BODY_CONNECTIONS = [
+                    [11, 12], [11, 23], [12, 24], [23, 24], // Torso
+                    [11, 13], [13, 15], // Left arm (stops at wrist, no hands)
+                    [12, 14], [14, 16]  // Right arm (stops at wrist, no hands)
+                ];
+
+                // Draw ONLY the upper body connections to give proper skeleton without messy hands
+                drawConnectors(canvasCtx, matrix_lm, UPPER_BODY_CONNECTIONS, {color: color, lineWidth: 3});
+                
+                // Draw a dynamic "spine/neck" line connecting the sharp bottom of HUD to the shoulders
+                const neck_anchor = {x: (lm[11].x + lm[12].x)/2, y: (lm[11].y + lm[12].y)/2, z: 0};
+                matrix_lm[33 + num_dots + 1] = neck_anchor;
+                drawConnectors(canvasCtx, matrix_lm, [[33 + 0, 33 + num_dots + 1]], {color: color, lineWidth: 2, dash: [5, 5]});
+                
+                // Draw the dynamic geometric face matrix HUD
+                drawConnectors(canvasCtx, matrix_lm, HEAD_HUD_CONNECTIONS, {color: '#38bdf8', lineWidth: 1.8});
+                
+                // Draw glowing dots covering the whole face
+                const face_nodes = [];
+                for(let i=0; i<=num_dots; i++) face_nodes.push(matrix_lm[33+i]);
+                drawLandmarks(canvasCtx, face_nodes, {color: '#ffffff', fillColor: '#38bdf8', lineWidth: 1.5, radius: 2.5});
+                
+                // Draw nodes ONLY for the essential posture points (no hands)
+                const visible_body_nodes = [lm[11], lm[12], lm[23], lm[24], lm[13], lm[14], lm[15], lm[16]];
+                drawLandmarks(canvasCtx, visible_body_nodes, {color: '#ffffff', fillColor: color, lineWidth: 2, radius: 4});
+
+                scoreDisplay.innerText = score + '%';
+                scoreDisplay.style.color = color;
+                statusBadge.innerText = statusText;
+                statusBadge.className = badgeClass;
+                metricsText.innerText = `Neck: ${neck_angle.toFixed(1)}° | Slant: ${shoulder_slant.toFixed(1)}° | F/S: ${fts_ratio.toFixed(2)} | Spine: ${spine_angle.toFixed(1)}°`;
+
+                if (sessionActive) {
+                    if (!window.lastSync || now - window.lastSync > 2000 || slouchCount !== lastReportedSlouchCount) {
+                        syncToStreamlit(score, statusText, neck_angle, shoulder_slant);
+                        window.lastSync = now;
+                        lastReportedSlouchCount = slouchCount;
+                    }
+                }
+
+            }
+            canvasCtx.restore();
+        }
+
+        const pose = new Pose({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}` });
+        pose.setOptions({
+            modelComplexity: 2, 
+            smoothLandmarks: true,
+            minDetectionConfidence: 0.65,
+            minTrackingConfidence: 0.65
+        });
+        pose.onResults(onResults);
+
+        function handleStreamSuccess(stream) {
+            videoElement.srcObject = stream;
+            videoElement.play();
+            async function renderLoop() {
+                if (!videoElement.paused && !videoElement.ended) {
+                    await pose.send({image: videoElement});
+                }
+                // Use setTimeout instead of requestAnimationFrame so the AI continues 
+                // processing frames and beeping even when the window is minimized.
+                setTimeout(renderLoop, 33); // Target ~30fps
+            }
+            renderLoop();
+        }
+
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 } }, audio: false })
+            .then(handleStreamSuccess)
+            .catch(err => {
+                if (permNotice) permNotice.style.display = 'block';
+            });
+        } else {
+            if (permNotice) permNotice.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
